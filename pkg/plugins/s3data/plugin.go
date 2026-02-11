@@ -206,6 +206,14 @@ func (p *Plugin) storeData(ctx context.Context, data interface{}) error {
 		return fmt.Errorf("failed to create transaction: %w", err)
 	}
 
+	// Ensure parent paths exist before writing
+	if len(path) > 1 {
+		if err := storage.MakeDir(ctx, store, txn, path[:len(path)-1]); err != nil {
+			store.Abort(ctx, txn)
+			return fmt.Errorf("failed to create parent path: %w", err)
+		}
+	}
+
 	// Use EOPA's optimized WriteUncheckedTxn for efficient data ingestion
 	if err := inmem.WriteUncheckedTxn(ctx, store, txn, storage.ReplaceOp, path, data); err != nil {
 		store.Abort(ctx, txn)
