@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	inmem "github.com/open-policy-agent/eopa/pkg/storage"
 	"github.com/open-policy-agent/opa/v1/logging"
 	"github.com/open-policy-agent/opa/v1/plugins"
 	"github.com/open-policy-agent/opa/v1/storage"
@@ -192,7 +193,7 @@ func (p *Plugin) fetchData(ctx context.Context) (interface{}, error) {
 	return data, nil
 }
 
-// storeData writes the fetched data to OPA's storage
+// storeData writes the fetched data to OPA's storage using EOPA's optimized ingestion
 func (p *Plugin) storeData(ctx context.Context, data interface{}) error {
 	store := p.manager.Store
 	path, ok := storage.ParsePath(p.config.Path)
@@ -205,19 +206,10 @@ func (p *Plugin) storeData(ctx context.Context, data interface{}) error {
 		return fmt.Errorf("failed to create transaction: %w", err)
 	}
 
-	// Ensure parent paths exist
-	if err := storage.MakeDir(ctx, store, txn, path[:len(path)-1]); err != nil {
+	// Use EOPA's optimized WriteUncheckedTxn for efficient data ingestion
+	if err := inmem.WriteUncheckedTxn(ctx, store, txn, storage.ReplaceOp, path, data); err != nil {
 		store.Abort(ctx, txn)
-		return fmt.Errorf("failed to create parent path: %w", err)
-	}
-
-	// Write the data
-	if err := store.Write(ctx, txn, storage.AddOp, path, data); err != nil {
-		// Try replace if add fails (path already exists)
-		if err := store.Write(ctx, txn, storage.ReplaceOp, path, data); err != nil {
-			store.Abort(ctx, txn)
-			return fmt.Errorf("failed to write data: %w", err)
-		}
+		return fmt.Errorf("failed to write data to %v: %w", path, err)
 	}
 
 	if err := store.Commit(ctx, txn); err != nil {
@@ -239,5 +231,5 @@ func (p *Plugin) Trigger(ctx context.Context, txn storage.Transaction) error {
 		return fmt.Errorf("invalid storage path %q", p.config.Path)
 	}
 
-	return p.manager.Store.Write(ctx, txn, storage.ReplaceOp, path, data)
+	return inmem.WriteUncheckedTxn(ctx, p.manager.Store, txn, storage.ReplaceOp, path, data)
 }
