@@ -1,243 +1,249 @@
 package s3data
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	inmem "github.com/open-policy-agent/eopa/pkg/storage"
+
 	"github.com/open-policy-agent/opa/v1/logging"
 	"github.com/open-policy-agent/opa/v1/plugins"
 	"github.com/open-policy-agent/opa/v1/storage"
+
+	"github.com/open-policy-agent/eopa/pkg/plugins/data/transform"
+	"github.com/open-policy-agent/eopa/pkg/plugins/data/types"
+	"github.com/open-policy-agent/eopa/pkg/plugins/data/utils"
 )
 
-// Plugin implements the s3data data source plugin
-type Plugin struct {
-	manager  *plugins.Manager
-	config   Config
-	log      logging.Logger
-	stop     chan struct{}
-	s3Client *s3.Client
+const (
+	DownloaderMaxConcurrency = 5                // Maximum # of parallel downloads per Read() call.
+	DownloaderMaxPartSize    = 32 * 1024 * 1024 // 32 MB per part.
+)
+
+// Data plugin
+type Data struct {
+	manager        *plugins.Manager
+	log            logging.Logger
+	Config         Config
+	hc             *http.Client
+	awsConfig      *aws.Config
+	s3Options      []func(*s3.Options)
+	exit, doneExit chan struct{}
+
+	*transform.Rego
 }
 
-// Start initializes and starts the plugin
-func (p *Plugin) Start(ctx context.Context) error {
-	p.log.Info("Starting s3data plugin", "bucket", p.config.Bucket, "key", p.config.Key, "path", p.config.Path)
+// Ensure that this sub-plugin will be triggered by the data umbrella plugin,
+// because it implements types.Triggerer.
+var _ types.Triggerer = (*Data)(nil)
 
-	// Initialize S3 client with IRSA support
-	if err := p.initS3Client(ctx); err != nil {
-		return fmt.Errorf("failed to initialize S3 client: %w", err)
+func (c *Data) Start(ctx context.Context) error {
+	if err := c.Prepare(ctx); err != nil {
+		return fmt.Errorf("prepare rego_transform: %w", err)
 	}
-
-	// Fetch initial data
-	if err := p.fetchAndStore(ctx); err != nil {
-		p.log.Warn("Failed to fetch initial data from S3", "error", err)
-		// Don't fail startup, just log the error
-	}
-
-	// Start background polling
-	go p.pollLoop()
-
-	// Update plugin status
-	p.manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateOK})
-
-	return nil
-}
-
-// initS3Client initializes the S3 client with IRSA credentials
-func (p *Plugin) initS3Client(ctx context.Context) error {
-	// Load AWS config - automatically uses IRSA when running in EKS
-	// IRSA sets AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE environment variables
-	// The SDK's default credential chain handles this automatically
-	opts := []func(*config.LoadOptions) error{}
-
-	// Set region if specified
-	if p.config.Region != "" {
-		opts = append(opts, config.WithRegion(p.config.Region))
-	}
-
-	cfg, err := config.LoadDefaultConfig(ctx, opts...)
-	if err != nil {
-		return fmt.Errorf("failed to load AWS config: %w", err)
-	}
-
-	// If a specific role ARN is provided, assume that role
-	if p.config.RoleARN != "" {
-		stsClient := sts.NewFromConfig(cfg)
-		creds := stscreds.NewAssumeRoleProvider(stsClient, p.config.RoleARN)
-		cfg.Credentials = aws.NewCredentialsCache(creds)
-		p.log.Info("Configured to assume role", "role_arn", p.config.RoleARN)
-	}
-
-	// Create S3 client options
-	s3Opts := []func(*s3.Options){}
-
-	// Custom endpoint for S3-compatible storage
-	if p.config.Endpoint != "" {
-		s3Opts = append(s3Opts, func(o *s3.Options) {
-			o.BaseEndpoint = aws.String(p.config.Endpoint)
-		})
-		p.log.Info("Using custom S3 endpoint", "endpoint", p.config.Endpoint)
-	}
-
-	// Path-style addressing for S3-compatible storage
-	if p.config.UsePathStyle {
-		s3Opts = append(s3Opts, func(o *s3.Options) {
-			o.UsePathStyle = true
-		})
-	}
-
-	p.s3Client = s3.NewFromConfig(cfg, s3Opts...)
-	p.log.Info("S3 client initialized successfully")
-
-	return nil
-}
-
-// Stop gracefully stops the plugin
-func (p *Plugin) Stop(ctx context.Context) {
-	p.log.Info("Stopping s3data plugin")
-	close(p.stop)
-	p.manager.UpdatePluginStatus(Name, &plugins.Status{State: plugins.StateNotReady})
-}
-
-// Reconfigure updates the plugin configuration
-func (p *Plugin) Reconfigure(ctx context.Context, cfg interface{}) {
-	newConfig := cfg.(Config)
-	p.log.Info("Reconfiguring s3data plugin", "bucket", newConfig.Bucket, "key", newConfig.Key)
-
-	// Check if S3 client needs to be recreated
-	needsNewClient := p.config.Region != newConfig.Region ||
-		p.config.Endpoint != newConfig.Endpoint ||
-		p.config.RoleARN != newConfig.RoleARN ||
-		p.config.UsePathStyle != newConfig.UsePathStyle
-
-	p.config = newConfig
-
-	if needsNewClient {
-		if err := p.initS3Client(ctx); err != nil {
-			p.log.Error("Failed to reinitialize S3 client", "error", err)
-			return
-		}
-	}
-
-	// Fetch data with new config
-	if err := p.fetchAndStore(ctx); err != nil {
-		p.log.Warn("Failed to fetch data after reconfigure", "error", err)
-	}
-}
-
-// pollLoop periodically fetches data from S3
-func (p *Plugin) pollLoop() {
-	ticker := time.NewTicker(p.config.GetPollInterval())
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-p.stop:
-			return
-		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := p.fetchAndStore(ctx); err != nil {
-				p.log.Warn("Failed to fetch data during poll", "error", err)
-			}
-			cancel()
-		}
-	}
-}
-
-// fetchAndStore fetches data from S3 and stores it in OPA
-func (p *Plugin) fetchAndStore(ctx context.Context) error {
-	data, err := p.fetchData(ctx)
-	if err != nil {
-		return fmt.Errorf("fetch failed: %w", err)
-	}
-
-	if err := p.storeData(ctx, data); err != nil {
-		return fmt.Errorf("store failed: %w", err)
-	}
-
-	p.log.Debug("Successfully fetched and stored S3 data", "bucket", p.config.Bucket, "key", p.config.Key, "path", p.config.Path)
-	return nil
-}
-
-// fetchData retrieves data from S3
-func (p *Plugin) fetchData(ctx context.Context) (interface{}, error) {
-	input := &s3.GetObjectInput{
-		Bucket: aws.String(p.config.Bucket),
-		Key:    aws.String(p.config.Key),
-	}
-
-	result, err := p.s3Client.GetObject(ctx, input)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get S3 object: %w", err)
-	}
-	defer result.Body.Close()
-
-	body, err := io.ReadAll(result.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read S3 object body: %w", err)
-	}
-
-	var data interface{}
-	if err := json.Unmarshal(body, &data); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON from S3 object: %w", err)
-	}
-
-	return data, nil
-}
-
-// storeData writes the fetched data to OPA's storage using EOPA's optimized ingestion
-func (p *Plugin) storeData(ctx context.Context, data interface{}) error {
-	store := p.manager.Store
-	path, ok := storage.ParsePath(p.config.Path)
-	if !ok {
-		return fmt.Errorf("invalid storage path %q", p.config.Path)
-	}
-
-	txn, err := store.NewTransaction(ctx, storage.WriteParams)
-	if err != nil {
-		return fmt.Errorf("failed to create transaction: %w", err)
-	}
-
-	// Ensure parent paths exist before writing
-	if len(path) > 1 {
-		if err := storage.MakeDir(ctx, store, txn, path[:len(path)-1]); err != nil {
-			store.Abort(ctx, txn)
-			return fmt.Errorf("failed to create parent path: %w", err)
-		}
-	}
-
-	// Use EOPA's optimized WriteUncheckedTxn for efficient data ingestion
-	if err := inmem.WriteUncheckedTxn(ctx, store, txn, storage.ReplaceOp, path, data); err != nil {
-		store.Abort(ctx, txn)
-		return fmt.Errorf("failed to write data to %v: %w", path, err)
-	}
-
-	if err := store.Commit(ctx, txn); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
-}
-
-// Trigger implements the types.Triggerer interface for manual data refresh
-func (p *Plugin) Trigger(ctx context.Context, txn storage.Transaction) error {
-	data, err := p.fetchData(ctx)
+	c.hc = &http.Client{}
+	// Use the default credential chain which automatically supports IRSA in EKS.
+	// When running in EKS with IRSA, the SDK picks up AWS_ROLE_ARN and
+	// AWS_WEB_IDENTITY_TOKEN_FILE environment variables injected by the pod identity webhook.
+	cfg, err := config.LoadDefaultConfig(
+		ctx,
+		config.WithHTTPClient(c.hc),
+		config.WithRegion(c.Config.region),
+	)
 	if err != nil {
 		return err
 	}
 
-	path, ok := storage.ParsePath(p.config.Path)
-	if !ok {
-		return fmt.Errorf("invalid storage path %q", p.config.Path)
+	// If a specific role ARN is provided, assume that role via STS
+	if c.Config.RoleARN != "" {
+		stsClient := sts.NewFromConfig(cfg)
+		creds := stscreds.NewAssumeRoleProvider(stsClient, c.Config.RoleARN)
+		cfg.Credentials = aws.NewCredentialsCache(creds)
+		c.log.Info("Configured to assume role via STS: %s", c.Config.RoleARN)
 	}
 
-	return inmem.WriteUncheckedTxn(ctx, p.manager.Store, txn, storage.ReplaceOp, path, data)
+	// endpoint and ForcePath should be populated by the config logic.
+	s3Options := []func(*s3.Options){}
+	if c.Config.endpoint != "" {
+		s3Options = append(s3Options, func(o *s3.Options) {
+			o.EndpointResolverV2 = newCustomEndpointResolver(c.Config.endpoint)
+		})
+	}
+	if c.Config.ForcePath {
+		s3Options = append(s3Options, func(o *s3.Options) { o.UsePathStyle = true })
+	}
+
+	c.awsConfig = &cfg
+	c.s3Options = s3Options
+
+	c.exit = make(chan struct{})
+	if err := storage.Txn(ctx, c.manager.Store, storage.WriteParams, func(txn storage.Transaction) error {
+		return storage.MakeDir(ctx, c.manager.Store, txn, c.Config.path)
+	}); err != nil {
+		return err
+	}
+	c.doneExit = make(chan struct{})
+	go c.loop(ctx)
+	return nil
+}
+
+func (c *Data) Stop(context.Context) {
+	if c.doneExit == nil {
+		return
+	}
+	close(c.exit) // stops our polling loop
+	<-c.doneExit  // waits for polling loop to be stopped
+	c.hc.CloseIdleConnections()
+}
+
+func (c *Data) Reconfigure(ctx context.Context, next any) {
+	if c.Config.Equal(next.(Config)) {
+		return // nothing to do
+	}
+	if c.doneExit != nil { // started before
+		c.Stop(ctx)
+	}
+	c.Config = next.(Config)
+	c.Start(ctx)
+}
+
+// dataPlugin accessors
+func (c *Data) Name() string {
+	return Name
+}
+
+func (c *Data) Path() storage.Path {
+	return c.Config.path
+}
+
+func (c *Data) loop(ctx context.Context) {
+	timer := time.NewTimer(0) // zero timer is needed to execute immediately for first time
+
+LOOP:
+	for {
+		select {
+		case <-ctx.Done():
+			break LOOP
+		case <-c.exit:
+			break LOOP
+		case <-timer.C:
+		}
+		if err := c.poll(ctx); err != nil {
+			c.log.Error("polling data from s3 failed: %+v", err)
+		}
+		timer.Reset(c.Config.interval)
+	}
+	// stop and drain the timer
+	if !timer.Stop() && len(timer.C) > 0 {
+		<-timer.C
+	}
+	close(c.doneExit)
+}
+
+func (c *Data) poll(ctx context.Context) error {
+	svc := s3.NewFromConfig(*c.awsConfig, c.s3Options...)
+	keys, err := c.getKeys(ctx, svc)
+	if err != nil {
+		return fmt.Errorf("list objects: %w", err)
+	}
+
+	results, err := c.process(ctx, svc, keys)
+	if err != nil {
+		return err
+	}
+	if results == nil {
+		return nil
+	}
+
+	if err := c.Ingest(ctx, c.Path(), results); err != nil {
+		return fmt.Errorf("plugin %s at %s: %w", c.Name(), c.Config.path, err)
+	}
+	return nil
+}
+
+func (c *Data) getKeys(ctx context.Context, svc *s3.Client) ([]string, error) {
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.Config.bucket),
+		Prefix: aws.String(c.Config.filepath),
+	}
+
+	var keys []string
+	paginator := s3.NewListObjectsV2Paginator(svc, input)
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("unable to get the list of objects: %w", err)
+		}
+
+		for _, o := range page.Contents {
+			keys = append(keys, *o.Key)
+		}
+	}
+
+	return keys, nil
+}
+
+func (c *Data) process(ctx context.Context, svc *s3.Client, keys []string) (any, error) {
+	switch len(keys) {
+	case 0:
+		return nil, nil
+	case 1:
+		// in case when the path parameter points to a single file
+		// the result should contain only the content of that file
+		r, err := c.download(ctx, svc, keys[0])
+		if err != nil {
+			return nil, err
+		}
+		return utils.ParseFile(keys[0], r)
+	}
+
+	files := make(map[string]any)
+	for _, key := range keys {
+		r, err := c.download(ctx, svc, key)
+		if err != nil {
+			return nil, err
+		}
+		document, err := utils.ParseFile(key, r)
+		if err != nil {
+			return nil, err
+		}
+		if document == nil {
+			continue
+		}
+
+		utils.InsertFile(files, strings.Split(key, "/"), document)
+	}
+
+	if len(files) == 0 {
+		return nil, nil
+	}
+	return files, nil
+}
+
+func (c *Data) download(ctx context.Context, svc *s3.Client, key string) (io.Reader, error) {
+	downloader := manager.NewDownloader(svc, func(d *manager.Downloader) {
+		d.Concurrency = DownloaderMaxConcurrency
+		d.PartSize = DownloaderMaxPartSize
+	})
+
+	buf := &manager.WriteAtBuffer{}
+	if _, err := downloader.Download(ctx, buf, &s3.GetObjectInput{
+		Bucket: aws.String(c.Config.bucket),
+		Key:    aws.String(key),
+	}); err != nil {
+		return nil, fmt.Errorf("unable to download data: %w", err)
+	}
+
+	return bytes.NewReader(buf.Bytes()), nil
 }

@@ -1,40 +1,93 @@
-// Package s3data provides an S3 data plugin for fetching data from AWS S3 with IRSA support.
 package s3data
 
 import (
+	"fmt"
+	"net/url"
+	"strings"
+	"time"
+
 	"github.com/open-policy-agent/opa/v1/plugins"
 	"github.com/open-policy-agent/opa/v1/util"
+
+	"github.com/open-policy-agent/eopa/pkg/plugins/data/transform"
+	"github.com/open-policy-agent/eopa/pkg/plugins/data/utils"
 )
 
-// Name is the registered name of this plugin
 const Name = "s3data"
 
 type factory struct{}
 
-// Factory returns a new plugin factory for the s3data plugin
 func Factory() plugins.Factory {
 	return &factory{}
 }
 
-// New creates a new instance of the s3data plugin
-func (f *factory) New(m *plugins.Manager, cfg interface{}) plugins.Plugin {
-	c := cfg.(Config)
-	return &Plugin{
+func (factory) New(m *plugins.Manager, config any) plugins.Plugin {
+	c := config.(Config)
+	return &Data{
+		Config:  c,
+		log:     m.Logger(),
+		exit:    make(chan struct{}),
 		manager: m,
-		config:  c,
-		log:     m.Logger().WithFields(map[string]interface{}{"plugin": Name}),
-		stop:    make(chan struct{}),
+		Rego:    transform.New(m, c.Path, Name, c.RegoTransformRule),
 	}
 }
 
-// Validate validates the plugin configuration
-func (f *factory) Validate(m *plugins.Manager, config []byte) (interface{}, error) {
+func (factory) Validate(_ *plugins.Manager, config []byte) (any, error) {
 	c := Config{}
-	if err := util.Unmarshal(config, &c); err != nil {
+	err := util.Unmarshal(config, &c)
+	if err != nil {
 		return nil, err
 	}
-	if err := c.Validate(); err != nil {
+	if c.URL == "" {
+		return nil, fmt.Errorf("url required")
+	}
+
+	u, err := url.Parse(c.URL)
+	if err != nil {
 		return nil, err
 	}
+	var scheme string
+	switch u.Scheme {
+	case "":
+		scheme = AWSScheme
+		parts := strings.SplitN(u.Path, "/", 2)
+		c.bucket = parts[0]
+		if len(parts) == 2 {
+			c.filepath = parts[1]
+		}
+	case AWSScheme, GCSScheme:
+		scheme = u.Scheme
+		c.bucket = u.Host
+		c.filepath = strings.TrimPrefix(u.Path, "/")
+	default:
+		return nil, fmt.Errorf("unsupported bucket's schema %q in url %q, shoule be one of: %s", u.Scheme, c.URL, strings.Join([]string{AWSScheme, GCSScheme}, ","))
+	}
+
+	c.region = c.Region
+	if c.region == "" {
+		c.region = DefaultRegions[scheme]
+	}
+	if c.Endpoint == "" {
+		c.endpoint = DefaultEndpoints[scheme]
+	} else {
+		u, err := url.Parse(c.Endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("incorrect endpoint %q: %w", c.Endpoint, err)
+		}
+		c.endpoint = u.String()
+	}
+
+	if c.path, err = utils.AddDataPrefixAndParsePath(c.Path); err != nil {
+		return nil, err
+	}
+	if c.interval, err = utils.ParseInterval(c.Interval, 5*time.Minute, utils.DefaultMinInterval); err != nil {
+		return nil, err
+	}
+	if r := c.RegoTransformRule; r != "" {
+		if err := transform.Validate(r); err != nil {
+			return nil, err
+		}
+	}
+
 	return c, nil
 }
